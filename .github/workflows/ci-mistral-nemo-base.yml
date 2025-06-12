@@ -131,20 +131,9 @@ jobs:
            -d '{
               "text": "<|begin_of_text|>Name the capital of the United States.<|eot_id|>",
                 "sampling_params": {"max_completion_tokens": 50}
-            }'
-         
- 
-
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
-        with:
-          github_token: ${{ secrets.SHARK_PLATFORM_GH_TOKEN }}
-          publish_dir: ./out/llm/llama/benchmark
-          destination_dir: ./llm/llama/benchmark
-          keep_files: true
-
-      - name: Upload llama executable files
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: llama-files
-          path: ${{ github.workspace }}/${{ steps.date.outputs.date }}
+            }' > inference_output
+            grep ">Washington, D.C.<" inference_output
+            if [ $? != 0 ]; then
+                echo "Output is not correct. Check inference_log at $PWD Exiting."
+                exit 1
+            fi
