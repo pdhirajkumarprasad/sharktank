@@ -1,0 +1,144 @@
+# Copyright 2024 Advanced Micro Devices, Inc.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: Mistral nemo base 2407 E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekdays at 11:00 AM UTC = 03:00 AM PST / 04:00 AM PDT
+    - cron: "0 11 * * 0-6"
+
+concurrency:
+  # A PR number if a pull request and otherwise the commit hash. This cancels
+  # queued and in-progress runs for the same PR (presubmit) or commit
+  # (postsubmit). The workflow name is prepended to avoid conflicts between
+  # different workflows.
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  test_mistral_nemo_base_2407_serving:
+    if: ${{ github.repository_owner == 'nod-ai' || github.event_name != 'schedule' }}
+    timeout-minutes: 240
+    name: "Mistral nemo base 2407 E2E"
+    strategy:
+      matrix:
+        version: [3.12]
+      fail-fast: false
+    runs-on: linux-mi300-1gpu-ossci-nod-ai
+    defaults:
+      run:
+        shell: bash
+    env:
+      VENV_DIR: ${{ github.workspace }}/.venv
+      EXPORT_DIR: ${PWD}/export_dir
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: nod-ai/shark-ai
+          path: test-suite
+          
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ggml-org/llama.cpp 
+          path: test-suite
+          
+      - name: Get Current Date
+        id: date
+        run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+
+      - name: "Setting up Python"
+        id: setup_python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{matrix.version}}
+      - name: Create Python venv
+        run: python3.12 -m venv ${VENV_DIR}
+
+      - name: Install pip deps
+        run: |
+          source ${VENV_DIR}/bin/activate
+          python3.12 -m pip install --no-compile --upgrade pip
+
+          # Note: We install in three steps in order to satisfy requirements
+          # from non default locations first.
+          pip install sharktank -f https://github.com/nod-ai/shark-ai/releases/expanded_assets/dev-wheels --pre
+          pip install sharktuner -f https://github.com/nod-ai/shark-ai/releases/expanded_assets/dev-wheels --pre
+          pip install shortfin[apps] -f https://github.com/nod-ai/shark-ai/releases/expanded_assets/dev-wheels --pre
+          pip install -f https://iree.dev/pip-release-links.html --upgrade --pre \
+           iree-base-compiler \
+           iree-base-runtime \
+           iree-turbine
+          pip install torch --index-url https://download.pytorch.org/whl/cpu "torch>=2.4.0,<2.6.0"
+          
+          pip freeze
+
+      - name: Downloading model from HF
+        continue-on-error: true
+        run: |
+          pip install -U "huggingface_hub[cli]"
+          huggingface-cli login --token ${{ secrets.HF_TOKEN }}
+          huggingface-cli download mistralai/Mistral-Nemo-Base-2407 --force-download
+
+      - name: Converting safetensors to gguf
+        run: |
+           mkdir -p ~/.cache/sharktank/mistral-base-nemo-2407
+           cd llama.cpp
+           python3 convert_hf_to_gguf.py ~/.cache/huggingface/hub/models--mistralai--Mistral-Nemo-Base-2407/ --outtype f16 --outfile ${EXPORT_DIR}/mistral-nemo-base-2407.gguf
+           cd ..
+
+      - name: Export MLIR
+        run: |
+           python -m sharktank.examples.export_paged_llm_v1 \
+            --gguf-file=${EXPORT_DIR}/mistral-nemo-base-2407.gguf \
+            --output-mlir=${EXPORT_DIR}/mistral-nemo-base-2707.mlir \
+            --output-config=${EXPORT_DIR}/config.json \
+            --bs-prefill=4 \
+            --bs-decode=4
+
+      - name: Generate vmfb
+        run: |
+          iree-compile ${EXPORT_DIR}/mistral-nemo-base-2707.mlir \
+          --iree-hal-target-device=hip \
+          --iree-hip-target=gfx942 \
+          -o ${EXPORT_DIR}/mistral-nemo-base-2407.vmfb
+
+      - name: Run Shortfin server
+        run: |
+           python -m shortfin_apps.llm.server \
+           --tokenizer_json=$TOKENIZER_PATH \
+           --model_config=$OUTPUT_CONFIG_PATH \
+           --vmfb=$VMFB_PATH \
+           --parameters=$MODEL_PARAMS_PATH \
+           --device=hip \
+           --device_ids 0  --port 8954 |& tee shortfin_llm_server.log &
+           shortfin_process=$!
+
+      - name: Run Client
+        run: |
+           curl http://localhost:8000/generate \
+           -H "Content-Type: application/json" \
+           -d '{
+              "text": "<|begin_of_text|>Name the capital of the United States.<|eot_id|>",
+                "sampling_params": {"max_completion_tokens": 50}
+            }'
+         
+ 
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.SHARK_PLATFORM_GH_TOKEN }}
+          publish_dir: ./out/llm/llama/benchmark
+          destination_dir: ./llm/llama/benchmark
+          keep_files: true
+
+      - name: Upload llama executable files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: llama-files
+          path: ${{ github.workspace }}/${{ steps.date.outputs.date }}
